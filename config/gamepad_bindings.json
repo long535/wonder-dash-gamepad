@@ -1,0 +1,14 @@
+{
+  "buttons": {
+    "cross": {"action": "speak", "params": {"text": "siren"}},
+    "circle": {"action": "speak", "params": {"text": "hi"}},
+    "triangle": {"action": "speak", "params": {"text": "dino"}},
+    "square": {"action": "speak", "params": {"text": "tada"}},
+    "l1": {"action": "lights_blink", "params": {"ear": "left", "color": "yellow"}},
+    "r1": {"action": "lights_blink", "params": {"ear": "right", "color": "yellow"}},
+    "dpad_up": {"action": "lights_and_speak", "params": {"color": "red", "text": "siren"}},
+    "dpad_down": {"action": "lights", "params": {"neck_color": "blue", "left_ear_color": "blue", "right_ear_color": "blue"}},
+    "dpad_left": {"action": "lights", "params": {"neck_color": "green", "left_ear_color": "green", "right_ear_color": "green"}},
+    "dpad_right": {"action": "lights", "params": {"neck_color": "black", "left_ear_color": "black", "right_ear_color": "black", "eye_brightness": 0}}
+  }
+}

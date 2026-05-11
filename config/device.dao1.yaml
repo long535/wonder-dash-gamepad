@@ -1,0 +1,39 @@
+device:
+  brand: Wonder Workshop
+  product: Dash
+  model: DAO1
+  fcc_id: 2ACRI-PLI0010
+  serial: BO0416204JTL0064
+
+transport:
+  primary: ble
+  bridge_host: 192.168.1.184
+  bridge_port: 8787
+  adapter: hci0
+
+capabilities:
+  mobility: true
+  lights: true
+  speaker: true
+  camera: pending_verification
+  microphone: pending_verification
+  sensors: pending_verification
+
+control_plan:
+  current_driver_mode: mock
+  target_driver_mode: real
+  candidate_library: mewmix/bleak-dash
+  real_driver_status: scaffolded
+  mac_address: null
+
+safety:
+  max_move_duration_ms: 3000
+  max_route_duration_s: 60
+  stop_on_disconnect: true
+  require_short_test_before_full_route: true
+  indoor_only: true
+
+notes:
+  - Use Raspberry Pi as BLE bridge; do not prioritize VM Bluetooth.
+  - Verify harmless actions first: lights, speaker, then short movement.
+  - Confirm camera/mic path from real hardware or app once device is in hand.

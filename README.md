@@ -1,50 +1,115 @@
-# Wonder Dash Gamepad Controller & Bridge API Update
+# Wonder Dash as OpenClaw Body v1
 
-This project is an intermediate summary of the enhancements made to the Wonder Dash robotics bridge. It includes a custom gamepad controller script running on a Raspberry Pi, integrated with a FastAPI web bridge for the Wonder Dash robot.
+## Goal
+Let OpenClaw issue high-level commands like:
+- `go to living_room`
+- `wander around`
+- `stop`
 
-## Features
+and have a Raspberry Pi bridge translate them into Wonder Dash movement commands.
 
-- **Gamepad Control (PS4/PS5 Controllers)**:
-  - Connect a Bluetooth gamepad to steer the robot.
-  - Automatically filters out virtual interfaces (Touchpad, Motion Sensors) to reliably attach to the main `evdev` input.
-  - **L3 (Left Stick Click)**: Instantly stops the robot.
-  - **R3 (Right Stick Click)**: Centers the robot's head (Yaw: 0, Pitch: 0).
-  - Left Analog Stick for omnidirectional movement.
-  - Right Analog Stick for head look (yaw/pitch).
-  - L2/R2 to control movement speed.
-  - D-Pad (Up, Down, Left, Right) to trigger specific light patterns.
-  - Face Buttons (Cross, Circle, Triangle, Square) and Bumpers (L1, R1) to trigger sound and ear light effects.
-- **Web UI & API Integration**:
-  - The Python `gamepad_controller.py` runs as a systemd service (`wonder-dash-gamepad.service`) in the background.
-  - It communicates via HTTP POST to the local FastAPI bridge (`wonder-dash-body.service`).
-  - Periodically pings the `/gamepad/ping` endpoint to report connection status.
-  - **Web Dashboard**: The `app.py` UI displays real-time `PAD CONNECTED` / `PAD DISCONNECTED` badges based on the active Bluetooth controller status.
-- **Movement Logic Fixes**:
-  - Re-mapped "Turn Left" and "Turn Right" API actions to use the robot's native `.spin()` method. This fixes previous issues where the robot would drive in wide arcs or move forward unnecessarily instead of rotating in place.
+## Architecture
+- **OpenClaw**: intent understanding, route selection, safety policy
+- **Bridge API**: small HTTP service on Raspberry Pi
+- **Dash driver**: BLE connection + primitive actions
+- **Routes config**: named locations and prerecorded action sequences
 
-## Files Updated
-- `gamepad_controller.py`: The `evdev`-based background service connecting the PS4/PS5 controller to the HTTP API.
-- `app.py`: FastAPI server serving the control dashboard and bridging HTTP commands to the Dash Python SDK.
-- `driver_adapter.py`: Adapter layer handling actual hardware commands, specifically improved for accurate in-place spinning.
+## v1 Scope
+v1 does **not** attempt SLAM or precise indoor localization.
+It uses:
+- named places
+- prerecorded routes
+- simple movement primitives
+- stop / timeout safety
 
-## Systemd Services Setup
-```ini
-# /etc/systemd/system/wonder-dash-gamepad.service
-[Unit]
-Description=Wonder Dash Gamepad Controller
-After=wonder-dash-body.service
+## Command Flow
+1. User says `去 living room`
+2. OpenClaw maps that to `route=living_room`
+3. Pi bridge loads the route from `config/routes.example.yaml`
+4. Pi executes movement primitives on Dash
+5. Pi returns status/events
 
-[Service]
-User=root
-WorkingDirectory=/home/pi/wonder-dash-body
-Environment="PATH=/home/pi/wonder-dash-body/.venv/bin"
-ExecStart=/home/pi/wonder-dash-body/.venv/bin/python gamepad_controller.py
-Restart=always
-RestartSec=3
+## Safety Rules
+- hard stop endpoint
+- per-command timeout
+- auto-stop on disconnect
+- reject concurrent route execution
+- max wander duration
+- optional quiet hours
 
-[Install]
-WantedBy=multi-user.target
+## API Sketch
+### `GET /health`
+Returns service and BLE status.
+
+### `POST /stop`
+Immediate stop.
+
+### `POST /move`
+```json
+{ "action": "forward", "duration_ms": 1200, "speed": 50 }
 ```
 
-## Note on Privacy
-This repository only contains the logic improvements and integration code. It does not include hardcoded MAC addresses, sensitive local network IPs, or personal identifiers.
+### `POST /route`
+```json
+{ "name": "living_room" }
+```
+
+### `POST /wander`
+```json
+{ "duration_s": 60 }
+```
+
+## Route Model
+Routes are sequences of primitive steps.
+Example:
+```yaml
+routes:
+  living_room:
+    - action: forward
+      duration_ms: 3500
+      speed: 50
+    - action: turn_right
+      duration_ms: 900
+      speed: 35
+    - action: forward
+      duration_ms: 2400
+      speed: 50
+```
+
+## Milestones
+1. Confirm BLE library/protocol for Dash
+2. Bring up Pi bridge service
+3. Implement fake driver for dry-run testing
+4. Replace fake driver with real Dash driver
+5. Calibrate named routes in the home
+6. Add wander mode + recovery rules
+
+## Current Status
+- Raspberry Pi reachable over SSH
+- Bluetooth stack enabled and unblocked
+- Python/BLE build dependencies installed
+- Bridge skeleton prepared in this workspace
+- Driver adapter split into `mock` and placeholder `real` modes
+- Candidate BLE library path validated: `mewmix/bleak-dash` works best so far on Pi when installed with a newer `bleak`
+
+## Pre-Hardware Next Steps
+Even without the robot physically present, these are worth doing:
+1. Keep the bridge in `mock` mode for API and route testing
+2. Refine route schema and safety policy
+3. Add a real-driver adapter layer so hardware hookup is a drop-in change
+4. Prepare calibration notes for named places like `living_room`, `dock`, `hallway`
+
+## DAO1 Device Profile
+See:
+- `config/device.dao1.yaml`
+- `DAO1-ARRIVAL-CHECKLIST.md`
+
+These capture the known hardware identity, current assumptions, safety defaults, and the first-day bring-up sequence.
+
+## Suggested Next Step
+When Dash DAO1 is physically present:
+1. scan for the robot MAC address
+2. set `WONDER_DASH_DRIVER=real`
+3. set `WONDER_DASH_ADDRESS=<mac>`
+4. verify harmless commands first (lights/sound), then movement
+5. only then calibrate named routes like `living_room`

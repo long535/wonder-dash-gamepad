@@ -17,7 +17,12 @@ class BaseDashDriver:
     async def stop(self) -> None:
         raise NotImplementedError
 
+    async def drive_start(self, action: str, speed: int) -> Dict[str, Any]:
+        """Start continuous driving (non-blocking). Returns immediately."""
+        raise NotImplementedError
+
     async def move(self, action: str, duration_ms: int, speed: int) -> Dict[str, Any]:
+        """Legacy blocking move: drive for duration then stop."""
         raise NotImplementedError
 
     async def lights(
@@ -36,19 +41,44 @@ class BaseDashDriver:
     async def speak(self, text: str) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def get_sensors(self) -> Dict[str, Any]:
+        """Return current sensor readings (non-blocking)."""
+        return {}
+
 
 class MockDashDriver(BaseDashDriver):
     name = "mock"
 
     def __init__(self, state: Any) -> None:
         self.state = state
+        self._driving = False
+        self._driving_action: Optional[str] = None
 
     async def connect(self) -> None:
         await asyncio.sleep(0.1)
         self.state.connected = True
 
     async def stop(self) -> None:
+        self._driving = False
+        self._driving_action = None
         self.state.last_action = {"action": "stop", "driver": self.name}
+
+    async def drive_start(self, action: str, speed: int) -> Dict[str, Any]:
+        self._driving = True
+        self._driving_action = action
+        self.state.last_action = {
+            "action": action,
+            "mode": "continuous",
+            "speed": speed,
+            "driver": self.name,
+        }
+        return {
+            "ok": True,
+            "driver": self.name,
+            "action": action,
+            "mode": "continuous",
+            "speed": speed,
+        }
 
     async def move(self, action: str, duration_ms: int, speed: int) -> Dict[str, Any]:
         self.state.last_action = {
@@ -108,6 +138,18 @@ class MockDashDriver(BaseDashDriver):
         self.state.last_action = payload
         return payload
 
+    def get_sensors(self) -> Dict[str, Any]:
+        return {
+            "prox_left": 0,
+            "prox_right": 0,
+            "prox_rear": 0,
+            "moving": self._driving,
+            "picked_up": False,
+            "yaw": 0,
+            "pitch": 0,
+            "roll": 0,
+        }
+
 
 class RealDashDriver(BaseDashDriver):
     name = "real-dash"
@@ -116,6 +158,13 @@ class RealDashDriver(BaseDashDriver):
         self.state = state
         self.address = address
         self.robot = None
+        # Obstacle avoidance
+        self._obstacle_task: Optional[asyncio.Task] = None
+        self._obstacle_enabled = True
+        self._obstacle_threshold = 15  # proximity value above which = obstacle detected
+        self._driving = False
+        self._driving_action: Optional[str] = None
+        self._drive_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> None:
         if not self.address:
@@ -152,8 +201,63 @@ class RealDashDriver(BaseDashDriver):
             "address": self.address,
             "at": time.time(),
         }
+        # Start obstacle monitor
+        self._start_obstacle_monitor()
+
+    def _start_obstacle_monitor(self) -> None:
+        if self._obstacle_task is None or self._obstacle_task.done():
+            self._obstacle_task = asyncio.ensure_future(self._obstacle_monitor_loop())
+
+    async def _obstacle_monitor_loop(self) -> None:
+        """Background task: if driving forward and proximity sensor detects obstacle, auto-stop."""
+        while True:
+            try:
+                await asyncio.sleep(0.15)  # check ~7 times/sec
+                if not self._obstacle_enabled or not self._driving or not self.robot:
+                    continue
+                if not self.state.connected:
+                    continue
+
+                sensors = self.get_sensors()
+                prox_left = sensors.get("prox_left", 0)
+                prox_right = sensors.get("prox_right", 0)
+                prox_rear = sensors.get("prox_rear", 0)
+
+                obstacle_front = (
+                    self._driving_action in ("forward",)
+                    and (prox_left > self._obstacle_threshold or prox_right > self._obstacle_threshold)
+                )
+                obstacle_rear = (
+                    self._driving_action in ("backward",)
+                    and prox_rear > self._obstacle_threshold
+                )
+
+                if obstacle_front or obstacle_rear:
+                    # Auto-stop
+                    try:
+                        await self.robot.stop()
+                    except Exception:
+                        pass
+                    self._driving = False
+                    direction = "front" if obstacle_front else "rear"
+                    self.state.last_action = {
+                        "action": "obstacle_stop",
+                        "driver": self.name,
+                        "direction": direction,
+                        "prox_left": prox_left,
+                        "prox_right": prox_right,
+                        "prox_rear": prox_rear,
+                        "at": time.time(),
+                    }
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(1)
 
     async def reconnect(self) -> None:
+        if self._obstacle_task and not self._obstacle_task.done():
+            self._obstacle_task.cancel()
+            self._obstacle_task = None
         if self.robot and hasattr(self.robot, "disconnect"):
             try:
                 await self.robot.disconnect()
@@ -161,6 +265,7 @@ class RealDashDriver(BaseDashDriver):
                 pass
         self.robot = None
         self.state.connected = False
+        self._driving = False
         await self.connect()
 
     async def _ensure_connected(self) -> None:
@@ -168,6 +273,11 @@ class RealDashDriver(BaseDashDriver):
             await self.connect()
 
     async def stop(self) -> None:
+        self._driving = False
+        self._driving_action = None
+        if self._drive_task and not self._drive_task.done():
+            self._drive_task.cancel()
+        self._drive_task = None
         try:
             await self._ensure_connected()
             if self.robot and hasattr(self.robot, "stop"):
@@ -184,7 +294,80 @@ class RealDashDriver(BaseDashDriver):
             }
             raise
 
+    async def drive_start(self, action: str, speed: int) -> Dict[str, Any]:
+        """Non-blocking: start driving and return immediately. Motor keeps running until stop()."""
+        try:
+            await self._ensure_connected()
+            if not self.robot:
+                raise RuntimeError("Dash robot not connected")
+
+            drive_speed = max(60, min(300, int(speed)))
+
+            if self._drive_task and not self._drive_task.done():
+                self._drive_task.cancel()
+            self._drive_task = None
+
+            if action == "forward":
+                await self.robot.drive(abs(drive_speed))
+            elif action == "backward":
+                seconds = 30.0
+                speed_mmps = max(60, abs(drive_speed))
+                distance_mm = -int(speed_mmps * seconds)
+
+                async def run_backward():
+                    try:
+                        if self.robot and hasattr(self.robot, "move"):
+                            await self.robot.move(distance_mm=distance_mm, speed_mmps=speed_mmps, no_turn=True)
+                        elif self.robot:
+                            await self.robot.drive(-abs(drive_speed))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
+                self._drive_task = asyncio.create_task(run_backward())
+            elif action == "turn_left":
+                await self.robot.spin(-abs(drive_speed))
+            elif action == "turn_right":
+                await self.robot.spin(abs(drive_speed))
+            elif action == "stop":
+                await self.stop()
+                return {"ok": True, "driver": self.name, "action": "stop", "mode": "continuous"}
+            else:
+                raise ValueError(f"unsupported action: {action}")
+
+            self._driving = True
+            self._driving_action = action
+            self.state.last_action = {
+                "action": action,
+                "mode": "continuous",
+                "speed": drive_speed,
+                "driver": self.name,
+                "at": time.time(),
+            }
+            return {
+                "ok": True,
+                "driver": self.name,
+                "action": action,
+                "mode": "continuous",
+                "speed": drive_speed,
+            }
+        except Exception as exc:
+            self.state.connected = False
+            self.robot = None
+            self._driving = False
+            self.state.last_action = {
+                "action": "drive_start_failed",
+                "requested_action": action,
+                "speed": speed,
+                "driver": self.name,
+                "error": f"{type(exc).__name__}: {exc}",
+                "at": time.time(),
+            }
+            raise
+
     async def move(self, action: str, duration_ms: int, speed: int) -> Dict[str, Any]:
+        """Legacy blocking move (used by routes/wander)."""
         try:
             await self._ensure_connected()
             if not self.robot:
@@ -192,10 +375,15 @@ class RealDashDriver(BaseDashDriver):
 
             drive_speed = max(60, min(300, int(speed)))
             if action == "forward":
+                self._driving = True
+                self._driving_action = "forward"
                 await self.robot.drive(abs(drive_speed))
                 await asyncio.sleep(duration_ms / 1000)
                 await self.robot.stop()
+                self._driving = False
             elif action == "backward":
+                self._driving = True
+                self._driving_action = "backward"
                 seconds = max(0.1, duration_ms / 1000)
                 speed_mmps = max(60, abs(drive_speed))
                 distance_mm = -int(speed_mmps * seconds)
@@ -205,27 +393,38 @@ class RealDashDriver(BaseDashDriver):
                     await self.robot.drive(-abs(drive_speed))
                     await asyncio.sleep(seconds)
                     await self.robot.stop()
+                self._driving = False
             elif action == "turn_left":
                 seconds = max(0.1, duration_ms / 1000)
-                if hasattr(self.robot, "spin"):
+                speed_ratio = abs(drive_speed) / 200.0
+                degrees = -int(seconds * 171.9 * speed_ratio)
+                if hasattr(self.robot, "_get_move_byte_array") and hasattr(self.robot, "command"):
+                    byte_array = self.robot._get_move_byte_array(distance_mm=0, degrees=degrees, seconds=seconds)
+                    await self.robot.command("move", byte_array)
+                    await asyncio.sleep(seconds)
+                else:
                     await self.robot.spin(-abs(drive_speed))
                     await asyncio.sleep(seconds)
                     await self.robot.stop()
-                elif hasattr(self.robot, "turn"):
-                    await self.robot.turn(-90) # default to -90 if only turn is supported
             elif action == "turn_right":
                 seconds = max(0.1, duration_ms / 1000)
-                if hasattr(self.robot, "spin"):
+                speed_ratio = abs(drive_speed) / 200.0
+                degrees = int(seconds * 171.9 * speed_ratio)
+                if hasattr(self.robot, "_get_move_byte_array") and hasattr(self.robot, "command"):
+                    byte_array = self.robot._get_move_byte_array(distance_mm=0, degrees=degrees, seconds=seconds)
+                    await self.robot.command("move", byte_array)
+                    await asyncio.sleep(seconds)
+                else:
                     await self.robot.spin(abs(drive_speed))
                     await asyncio.sleep(seconds)
                     await self.robot.stop()
-                elif hasattr(self.robot, "turn"):
-                    await self.robot.turn(90)
             elif action == "stop":
                 await self.robot.stop()
+                self._driving = False
             else:
                 raise ValueError(f"unsupported real-dash action: {action}")
 
+            self._driving_action = None
             self.state.last_action = {
                 "action": action,
                 "duration_ms": duration_ms,
@@ -243,6 +442,7 @@ class RealDashDriver(BaseDashDriver):
         except Exception as exc:
             self.state.connected = False
             self.robot = None
+            self._driving = False
             self.state.last_action = {
                 "action": "move_failed",
                 "requested_action": action,
@@ -362,6 +562,40 @@ class RealDashDriver(BaseDashDriver):
                 "at": time.time(),
             }
             raise
+
+    def get_sensors(self) -> Dict[str, Any]:
+        """Return latest sensor readings from the robot's BLE notification stream."""
+        if not self.robot or not hasattr(self.robot, "sensor_state"):
+            return {}
+        ss = self.robot.sensor_state
+        return {
+            "prox_left": ss.get("prox_left", 0),
+            "prox_right": ss.get("prox_right", 0),
+            "prox_rear": ss.get("prox_rear", 0),
+            "yaw": ss.get("yaw", 0),
+            "pitch": ss.get("pitch", 0),
+            "roll": ss.get("roll", 0),
+            "moving": ss.get("moving", False),
+            "picked_up": ss.get("picked_up", False),
+            "hit": ss.get("hit", False),
+            "left_wheel": ss.get("left_wheel", 0),
+            "right_wheel": ss.get("right_wheel", 0),
+            "head_pitch": ss.get("head_pitch", 0),
+            "head_yaw": ss.get("head_yaw", 0),
+            "wheel_distance": ss.get("wheel_distance", 0),
+            "mic_level": ss.get("mic_level", 0),
+            "clap": ss.get("clap", False),
+            "sound_direction": ss.get("sound_direction", 0),
+        }
+
+    async def set_obstacle_avoidance(self, enabled: bool, threshold: int = 15) -> Dict[str, Any]:
+        self._obstacle_enabled = enabled
+        self._obstacle_threshold = threshold
+        return {
+            "ok": True,
+            "obstacle_avoidance": enabled,
+            "threshold": threshold,
+        }
 
 
 def build_driver(state: Any, mode: str = "mock", address: Optional[str] = None) -> BaseDashDriver:
