@@ -779,6 +779,7 @@ async function refresh() {{
       }}
       renderCamera();
     }}
+    }}
   }} catch(e) {{}}
 }}
 refresh();
