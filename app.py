@@ -762,23 +762,22 @@ async function pollSensors() {{
 // ── Status refresh ──
 async function refresh() {{
   try {{
-    const res = await fetch(/health);
+    const res = await fetch('/health');
     const d = await res.json();
-    const badge = document.getElementById(badge);
-    badge.textContent = d.connected ? CONNECTED : DISCONNECTED;
-    badge.className = badge  + (d.connected ? ok : bad);
-    document.getElementById(status_line).textContent =
-      `driver=${{d.driver}} | uptime=${{d.uptime_s}}s | busy=${{d.busy}} | routes=${{d.routes.join(, )}}`;
-    const last = d.last_action ? JSON.stringify(d.last_action).substring(0, 120) : none;
-    document.getElementById(output).textContent = last;
+    const badge = document.getElementById('badge');
+    badge.textContent = d.connected ? 'CONNECTED' : 'DISCONNECTED';
+    badge.className = 'badge ' + (d.connected ? 'ok' : 'bad');
+    document.getElementById('status_line').textContent =
+      `driver=${{d.driver}} | uptime=${{d.uptime_s}}s | busy=${{d.busy}} | routes=${{d.routes.join(', ')}}`;
+    const last = d.last_action ? JSON.stringify(d.last_action).substring(0, 120) : 'none';
+    document.getElementById('output').textContent = last;
     if (d.camera) {{
       cameraConfig = d.camera;
-      const input = document.getElementById(camera_url_input);
+      const input = document.getElementById('camera_url_input');
       if (input && !input.value.trim()) {{
-        input.value = d.camera.stream_url || d.camera.snapshot_url || d.camera.page_url || ;
+        input.value = d.camera.stream_url || d.camera.snapshot_url || d.camera.page_url || '';
       }}
       renderCamera();
-    }}
     }}
   }} catch(e) {{}}
 }}
