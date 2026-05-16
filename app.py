@@ -18,6 +18,9 @@ ROUTES_FILE = BASE_DIR / "config" / "routes.example.yaml"
 GAMEPAD_CONFIG_FILE = BASE_DIR / "config" / "gamepad_bindings.json"
 DRIVER_MODE = os.getenv("WONDER_DASH_DRIVER", "mock")
 DASH_ADDRESS = os.getenv("WONDER_DASH_ADDRESS")
+ESP32_CAM_STREAM_URL = os.getenv("ESP32_CAM_STREAM_URL", "http://192.168.1.204/stream").strip()
+ESP32_CAM_SNAPSHOT_URL = os.getenv("ESP32_CAM_SNAPSHOT_URL", "http://192.168.1.204/capture").strip()
+ESP32_CAM_PAGE_URL = os.getenv("ESP32_CAM_PAGE_URL", "http://192.168.1.204/").strip()
 
 app = FastAPI(title="Wonder Dash Bridge", version="1.01")
 
@@ -147,6 +150,12 @@ async def health() -> Dict[str, Any]:
         "last_action": state.last_action,
         "routes": sorted(load_routes().keys()),
         "dash_address": DASH_ADDRESS,
+        "camera": {
+            "stream_url": ESP32_CAM_STREAM_URL,
+            "snapshot_url": ESP32_CAM_SNAPSHOT_URL,
+            "page_url": ESP32_CAM_PAGE_URL,
+            "configured": bool(ESP32_CAM_STREAM_URL or ESP32_CAM_SNAPSHOT_URL or ESP32_CAM_PAGE_URL),
+        },
     }
 
 
@@ -334,15 +343,10 @@ async def control_panel() -> str:
   <style>
     * {{ box-sizing: border-box; }}
     body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f1f5f9; margin: 0; padding: 16px; }}
-    .wrap {{ max-width: 960px; margin: 0 auto; }}
+    .wrap {{ max-width: 1100px; margin: 0 auto; }}
     .card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,.3); }}
     h1 {{ margin: 0 0 8px; font-size: 22px; }}
     h2 {{ margin: 0 0 12px; font-size: 17px; color: #94a3b8; }}
-    .tabs {{ display: flex; gap: 4px; margin-bottom: 16px; }}
-    .tab {{ padding: 10px 20px; border-radius: 10px 10px 0 0; background: #334155; color: #94a3b8; border: none; cursor: pointer; font-size: 15px; font-weight: 600; }}
-    .tab.active {{ background: #1e293b; color: #f1f5f9; }}
-    .tab-content {{ display: none; }}
-    .tab-content.active {{ display: block; }}
     .grid3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
     button {{ border: 0; border-radius: 10px; padding: 12px 16px; background: #334155; color: white; font-size: 15px; cursor: pointer; transition: background .15s; }}
     button:hover {{ background: #475569; }}
@@ -354,12 +358,14 @@ async def control_panel() -> str:
     .success {{ background: #16a34a !important; }}
     .success:hover {{ background: #22c55e !important; }}
     .row {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }}
+    .stack {{ display: grid; gap: 16px; }}
+    .two-col {{ display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }}
     input, select {{ padding: 8px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: white; font-size: 14px; }}
     input[type="number"] {{ width: 80px; }}
-    input[type="text"] {{ width: 140px; }}
+    input[type="text"], input[type="url"] {{ width: 220px; max-width: 100%; }}
     input[type="color"] {{ width: 50px; height: 36px; padding: 2px; cursor: pointer; }}
     select {{ min-width: 140px; }}
-    pre {{ white-space: pre-wrap; word-break: break-word; background: #0f172a; padding: 12px; border-radius: 10px; font-size: 13px; max-height: 200px; overflow-y: auto; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; background: #0f172a; padding: 12px; border-radius: 10px; font-size: 13px; max-height: 220px; overflow-y: auto; }}
     label {{ font-size: 13px; color: #94a3b8; display: flex; align-items: center; gap: 6px; }}
     .badge {{ display: inline-block; padding: 4px 10px; border-radius: 999px; font-weight: 700; font-size: 12px; }}
     .badge.ok {{ background: #14532d; color: #bbf7d0; }}
@@ -378,193 +384,244 @@ async def control_panel() -> str:
     .gp-params {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }}
     .gp-params input {{ width: 100px; }}
     .gp-params input[type="color"] {{ width: 40px; }}
+    .camera-frame {{ width: 100%; aspect-ratio: 16 / 9; background: #020617; border: 1px solid #334155; border-radius: 14px; overflow: hidden; display: flex; align-items: center; justify-content: center; }}
+    .camera-frame img, .camera-frame iframe {{ width: 100%; height: 100%; border: 0; object-fit: cover; background: #020617; }}
+    .camera-placeholder {{ color: #94a3b8; font-size: 14px; text-align: center; padding: 24px; line-height: 1.6; }}
+    .small {{ font-size: 12px; color: #64748b; }}
+    .section-title {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
+    @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <div class="wrap stack">
     <div class="card">
       <h1>🤖 Wonder Dash Control Panel</h1>
       <div class="row">
         <div id="badge" class="badge bad">DISCONNECTED</div>
         <button onclick="reconnect()">Reconnect</button>
         <button onclick="refresh()">Refresh</button>
+        <button onclick="refreshCamera()">Refresh Camera</button>
       </div>
       <div style="font-size:12px;color:#64748b" id="status_line">loading...</div>
     </div>
 
-    <div class="tabs">
-      <button class="tab active" onclick="switchTab('drive')">🕹️ Drive</button>
-      <button class="tab" onclick="switchTab('lights')">💡 Lights</button>
-      <button class="tab" onclick="switchTab('sensors')">📡 Sensors</button>
-      <button class="tab" onclick="switchTab('gamepad')">🎮 Gamepad</button>
-      <button class="tab" onclick="switchTab('more')">⚙️ More</button>
+    <div class="card">
+      <div class="section-title">
+        <h2 style="margin-bottom:0">👁️ ESP32-CAM Live View</h2>
+        <div class="small" id="camera_status">camera loading...</div>
+      </div>
+      <div class="camera-frame" id="camera_frame">
+        <div class="camera-placeholder">Loading camera…</div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button onclick="openCameraPage()">Open Camera Page</button>
+        <label>Stream URL <input id="camera_url_input" type="url" placeholder="http://esp32-cam.local:81/stream" /></label>
+        <button class="success" onclick="applyCameraUrl()">Use This Stream</button>
+      </div>
+      <div class="small">上方顯示 ESP32-CAM 實時影像；下方直接操控 Dash。同頁完成，不用切頁。</div>
     </div>
 
-    <!-- DRIVE TAB -->
-    <div id="tab-drive" class="tab-content active">
-      <div class="card">
-        <h2>Manual Control</h2>
-        <div class="row">
-          <label>Speed <input id="speed" type="number" value="150" /></label>
+    <div class="two-col">
+      <div class="stack">
+        <div class="card">
+          <h2>🕹️ Manual Control</h2>
+          <div class="row">
+            <label>Speed <input id="speed" type="number" value="150" /></label>
+          </div>
+          <div class="grid3">
+            <div></div>
+            <button class="primary" onpointerdown="driveStart('forward')" onpointerup="driveStop()" onpointerleave="driveStop()">▲ Forward</button>
+            <div></div>
+            <button onpointerdown="driveStart('turn_left')" onpointerup="driveStop()" onpointerleave="driveStop()">◀ Left</button>
+            <button class="stop" onclick="driveStop()">■ Stop</button>
+            <button onpointerdown="driveStart('turn_right')" onpointerup="driveStop()" onpointerleave="driveStop()">▶ Right</button>
+            <div></div>
+            <button onpointerdown="driveStart('backward')" onpointerup="driveStop()" onpointerleave="driveStop()">▼ Back</button>
+            <div></div>
+          </div>
+          <div style="margin-top:12px;font-size:12px;color:#64748b">
+            Hold to drive · Release to stop · Touch, mouse, keyboard supported
+          </div>
         </div>
-        <div class="grid3">
-          <div></div>
-          <button class="primary" onpointerdown="driveStart('forward')" onpointerup="driveStop()" onpointerleave="driveStop()">▲ Forward</button>
-          <div></div>
-          <button onpointerdown="driveStart('turn_left')" onpointerup="driveStop()" onpointerleave="driveStop()">◀ Left</button>
-          <button class="stop" onclick="driveStop()">■ Stop</button>
-          <button onpointerdown="driveStart('turn_right')" onpointerup="driveStop()" onpointerleave="driveStop()">▶ Right</button>
-          <div></div>
-          <button onpointerdown="driveStart('backward')" onpointerup="driveStop()" onpointerleave="driveStop()">▼ Back</button>
-          <div></div>
+
+        <div class="card">
+          <h2>Timed Move / Routes / Wander</h2>
+          <div class="row">
+            <label>Duration ms <input id="duration" type="number" value="500" /></label>
+            <label>Move Speed <input id="move_speed" type="number" value="120" /></label>
+          </div>
+          <div class="row">
+            <button onclick="timedMove('forward')">Fwd</button>
+            <button onclick="timedMove('backward')">Back</button>
+            <button onclick="timedMove('turn_left')">Left</button>
+            <button onclick="timedMove('turn_right')">Right</button>
+          </div>
+          <div class="row" style="margin-top:14px">{routes}</div>
+          <div class="row" style="margin-top:14px">
+            <label>Wander s <input id="wander_s" type="number" value="10" /></label>
+            <button onclick="wander()">Start Wander</button>
+          </div>
         </div>
-        <div style="margin-top:12px;font-size:12px;color:#64748b">
-          Hold to drive · Release to stop · Touch & mouse supported
+
+        <div class="card">
+          <h2>💡 Lights / Look / Speak</h2>
+          <div class="row">
+            <label>Neck <input id="neck_color" type="color" value="#0088ff" /></label>
+            <label>Left Ear <input id="left_ear_color" type="color" value="#ff66aa" /></label>
+            <label>Right Ear <input id="right_ear_color" type="color" value="#66ff99" /></label>
+          </div>
+          <div class="row">
+            <label>Tail <input id="tail_brightness" type="number" value="180" /></label>
+            <label>Eyes <input id="eye_brightness" type="number" value="180" /></label>
+            <button class="success" onclick="setLights()">Apply Lights</button>
+            <button onclick="lightsOff()">All Off</button>
+          </div>
+          <div class="row">
+            <button onclick="presetLights('red')">🔴</button>
+            <button onclick="presetLights('green')">🟢</button>
+            <button onclick="presetLights('blue')">🔵</button>
+            <button onclick="presetLights('purple')">🟣</button>
+            <button onclick="presetLights('white')">⚪</button>
+            <button onclick="presetLights('rainbow')">🌈</button>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <label>Yaw <input id="yaw" type="number" value="0" /></label>
+            <label>Pitch <input id="pitch" type="number" value="0" /></label>
+            <button onclick="look()">Look</button>
+            <button onclick="lookCenter()">Center</button>
+          </div>
+          <div class="row">
+            <select id="speak_text" style="min-width:200px">
+              <option value="hi">hi</option>
+              <option value="siren">siren</option>
+              <option value="dino">dino</option>
+              <option value="tada">tada</option>
+            </select>
+            <button onclick="speak()">Speak</button>
+          </div>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Timed Move (Legacy)</h2>
-        <div class="row">
-          <label>Duration ms <input id="duration" type="number" value="500" /></label>
-          <label>Speed <input id="move_speed" type="number" value="120" /></label>
+      <div class="stack">
+        <div class="card">
+          <h2>📡 Live Sensors</h2>
+          <div class="sensors-grid" id="sensors_grid">
+            <div class="sensor-val"><div class="lbl">Prox Left</div><div class="val" id="s_prox_left">-</div></div>
+            <div class="sensor-val"><div class="lbl">Prox Right</div><div class="val" id="s_prox_right">-</div></div>
+            <div class="sensor-val"><div class="lbl">Prox Rear</div><div class="val" id="s_prox_rear">-</div></div>
+            <div class="sensor-val"><div class="lbl">Yaw</div><div class="val" id="s_yaw">-</div></div>
+            <div class="sensor-val"><div class="lbl">Pitch</div><div class="val" id="s_pitch">-</div></div>
+            <div class="sensor-val"><div class="lbl">Roll</div><div class="val" id="s_roll">-</div></div>
+            <div class="sensor-val"><div class="lbl">Moving</div><div class="val" id="s_moving">-</div></div>
+            <div class="sensor-val"><div class="lbl">Picked Up</div><div class="val" id="s_picked_up">-</div></div>
+            <div class="sensor-val"><div class="lbl">Wheel Dist</div><div class="val" id="s_wheel_distance">-</div></div>
+            <div class="sensor-val"><div class="lbl">Mic Level</div><div class="val" id="s_mic_level">-</div></div>
+          </div>
         </div>
-        <div class="row">
-          <button onclick="timedMove('forward')">Fwd</button>
-          <button onclick="timedMove('backward')">Back</button>
-          <button onclick="timedMove('turn_left')">Left</button>
-          <button onclick="timedMove('turn_right')">Right</button>
-        </div>
-      </div>
 
-      <div class="card">
-        <h2>Routes</h2>
-        <div class="row">{routes}</div>
-      </div>
+        <div class="card">
+          <h2>Obstacle Avoidance</h2>
+          <div class="row">
+            <label>Enabled <input id="obstacle_enabled" type="checkbox" checked /></label>
+            <label>Threshold <input id="obstacle_threshold" type="number" value="15" /></label>
+            <button class="success" onclick="setObstacle()">Apply</button>
+          </div>
+          <div class="small">When enabled, Dash auto-stops if proximity sensor detects obstacle while driving.</div>
+        </div>
 
-      <div class="card">
-        <h2>Wander</h2>
-        <div class="row">
-          <label>Duration s <input id="wander_s" type="number" value="10" /></label>
-          <button onclick="wander()">Start Wander</button>
+        <div class="card">
+          <h2>🎮 PS4 Controller Button Mapping</h2>
+          <p class="small" style="margin-top:0">Customise what each button does. Changes are saved to Pi and loaded by the gamepad controller.</p>
+          <table class="gp-table" id="gp_table">
+            <thead><tr><th>Button</th><th>Action</th><th>Parameters</th></tr></thead>
+            <tbody id="gp_tbody"></tbody>
+          </table>
+          <div class="row" style="margin-top:12px">
+            <button class="success" onclick="saveGamepadConfig()">💾 Save Config</button>
+            <button onclick="resetGamepadConfig()">↩️ Reset to Default</button>
+            <button onclick="loadGamepadConfig()">🔄 Reload</button>
+          </div>
+          <div id="gp_save_status" style="font-size:12px;color:#22c55e;margin-top:4px"></div>
         </div>
-      </div>
-    </div>
 
-    <!-- LIGHTS TAB -->
-    <div id="tab-lights" class="tab-content">
-      <div class="card">
-        <h2>Lights</h2>
-        <div class="row">
-          <label>Neck <input id="neck_color" type="color" value="#0088ff" /></label>
-          <label>Left Ear <input id="left_ear_color" type="color" value="#ff66aa" /></label>
-          <label>Right Ear <input id="right_ear_color" type="color" value="#66ff99" /></label>
+        <div class="card">
+          <h2>Last Response</h2>
+          <pre id="output">Ready.</pre>
         </div>
-        <div class="row">
-          <label>Tail <input id="tail_brightness" type="number" value="180" /></label>
-          <label>Eyes <input id="eye_brightness" type="number" value="180" /></label>
-          <button class="success" onclick="setLights()">Apply Lights</button>
-          <button onclick="lightsOff()">All Off</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <button onclick="presetLights('red')">🔴</button>
-          <button onclick="presetLights('green')">🟢</button>
-          <button onclick="presetLights('blue')">🔵</button>
-          <button onclick="presetLights('purple')">🟣</button>
-          <button onclick="presetLights('white')">⚪</button>
-          <button onclick="presetLights('rainbow')">🌈</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Head / Look</h2>
-        <div class="row">
-          <label>Yaw <input id="yaw" type="number" value="0" /></label>
-          <label>Pitch <input id="pitch" type="number" value="0" /></label>
-          <button onclick="look()">Look</button>
-          <button onclick="lookCenter()">Center</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Speak</h2>
-        <div class="row">
-          <select id="speak_text" style="min-width:200px">
-            <option value="hi">hi</option>
-            <option value="siren">siren</option>
-            <option value="dino">dino</option>
-            <option value="tada">tada</option>
-          </select>
-          <button onclick="speak()">Speak</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- SENSORS TAB -->
-    <div id="tab-sensors" class="tab-content">
-      <div class="card">
-        <h2>Live Sensors</h2>
-        <div class="sensors-grid" id="sensors_grid">
-          <div class="sensor-val"><div class="lbl">Prox Left</div><div class="val" id="s_prox_left">-</div></div>
-          <div class="sensor-val"><div class="lbl">Prox Right</div><div class="val" id="s_prox_right">-</div></div>
-          <div class="sensor-val"><div class="lbl">Prox Rear</div><div class="val" id="s_prox_rear">-</div></div>
-          <div class="sensor-val"><div class="lbl">Yaw</div><div class="val" id="s_yaw">-</div></div>
-          <div class="sensor-val"><div class="lbl">Pitch</div><div class="val" id="s_pitch">-</div></div>
-          <div class="sensor-val"><div class="lbl">Roll</div><div class="val" id="s_roll">-</div></div>
-          <div class="sensor-val"><div class="lbl">Moving</div><div class="val" id="s_moving">-</div></div>
-          <div class="sensor-val"><div class="lbl">Picked Up</div><div class="val" id="s_picked_up">-</div></div>
-          <div class="sensor-val"><div class="lbl">Wheel Dist</div><div class="val" id="s_wheel_distance">-</div></div>
-          <div class="sensor-val"><div class="lbl">Mic Level</div><div class="val" id="s_mic_level">-</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Obstacle Avoidance</h2>
-        <div class="row">
-          <label>Enabled <input id="obstacle_enabled" type="checkbox" checked /></label>
-          <label>Threshold <input id="obstacle_threshold" type="number" value="15" /></label>
-          <button class="success" onclick="setObstacle()">Apply</button>
-        </div>
-        <div style="font-size:12px;color:#64748b">When enabled, Dash auto-stops if proximity sensor detects obstacle while driving.</div>
-      </div>
-    </div>
-
-    <!-- GAMEPAD TAB -->
-    <div id="tab-gamepad" class="tab-content">
-      <div class="card">
-        <h2>🎮 PS4 Controller Button Mapping</h2>
-        <p style="font-size:13px;color:#64748b;margin-top:0">Customise what each button does. Changes are saved to Pi and loaded by the gamepad controller.</p>
-        <table class="gp-table" id="gp_table">
-          <thead><tr><th>Button</th><th>Action</th><th>Parameters</th></tr></thead>
-          <tbody id="gp_tbody"></tbody>
-        </table>
-        <div class="row" style="margin-top:12px">
-          <button class="success" onclick="saveGamepadConfig()">💾 Save Config</button>
-          <button onclick="resetGamepadConfig()">↩️ Reset to Default</button>
-          <button onclick="loadGamepadConfig()">🔄 Reload</button>
-        </div>
-        <div id="gp_save_status" style="font-size:12px;color:#22c55e;margin-top:4px"></div>
-      </div>
-    </div>
-
-    <!-- MORE TAB -->
-    <div id="tab-more" class="tab-content">
-      <div class="card">
-        <h2>Last Response</h2>
-        <pre id="output">Ready.</pre>
       </div>
     </div>
   </div>
 
 <script>
-// ── Tab switching ──
-function switchTab(name) {{
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.add('active');
-  document.querySelector(`.tab[onclick*="${{name}}"]`).classList.add('active');
-  if (name === 'sensors') startSensorPoll();
-  else stopSensorPoll();
-  if (name === 'gamepad') loadGamepadConfig();
+let cameraConfig = {{ stream_url: '', snapshot_url: '', page_url: '', configured: false }};
+
+function renderCamera() {{
+  const frame = document.getElementById('camera_frame');
+  const status = document.getElementById('camera_status');
+  const input = document.getElementById('camera_url_input');
+  const streamUrl = input.value.trim() || cameraConfig.stream_url;
+  if (cameraConfig.stream_url && !input.value.trim()) input.value = cameraConfig.stream_url;
+
+  if (streamUrl) {{
+    frame.innerHTML = `<img id="camera_stream" src="${{streamUrl}}?t=${{Date.now()}}" alt="ESP32-CAM stream" referrerpolicy="no-referrer" />`;
+    status.textContent = 'Live stream configured';
+    return;
+  }}
+  if (cameraConfig.snapshot_url) {{
+    frame.innerHTML = `<img id="camera_stream" src="${{cameraConfig.snapshot_url}}?t=${{Date.now()}}" alt="ESP32-CAM snapshot" referrerpolicy="no-referrer" />`;
+    status.textContent = 'Snapshot mode';
+    return;
+  }}
+  if (cameraConfig.page_url) {{
+    frame.innerHTML = `<iframe src="${{cameraConfig.page_url}}" title="ESP32-CAM page"></iframe>`;
+    status.textContent = 'Embedded camera page';
+    return;
+  }}
+  frame.innerHTML = `<div class="camera-placeholder">尚未設定 ESP32-CAM 串流 URL。<br>刷完 firmware 後，把 stream URL 填進來即可。</div>`;
+  status.textContent = 'Camera not configured yet';
+}}
+
+function refreshCamera() {{
+  const img = document.getElementById('camera_stream');
+  if (img && img.tagName === 'IMG') {{
+    const base = (document.getElementById('camera_url_input').value.trim() || cameraConfig.stream_url || cameraConfig.snapshot_url || '').split('?')[0];
+    if (base) img.src = `${{base}}?t=${{Date.now()}}`;
+  }} else {{
+    renderCamera();
+  }}
+}}
+
+function applyCameraUrl() {{
+  const input = document.getElementById('camera_url_input').value.trim();
+  if (!input) return;
+  cameraConfig.stream_url = input;
+  renderCamera();
+}}
+
+function openCameraPage() {{
+  const url = cameraConfig.page_url || cameraConfig.stream_url || cameraConfig.snapshot_url || document.getElementById('camera_url_input').value.trim();
+  if (url) window.open(url, '_blank', 'noopener');
+}}
+
+// ── Generic API call ──
+async function api(path, body) {{
+  try {{
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(path, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+      signal: controller.signal
+    }});
+    clearTimeout(timeout);
+    const text = await res.text();
+    document.getElementById('output').textContent = text;
+    return JSON.parse(text);
+  }} catch (e) {{
+    document.getElementById('output').textContent = 'Error: ' + e.message;
+    return null;
+  }}
 }}
 
 // ── Generic API call ──
@@ -705,15 +762,23 @@ async function pollSensors() {{
 // ── Status refresh ──
 async function refresh() {{
   try {{
-    const res = await fetch('/health');
+    const res = await fetch(/health);
     const d = await res.json();
-    const badge = document.getElementById('badge');
-    badge.textContent = d.connected ? 'CONNECTED' : 'DISCONNECTED';
-    badge.className = 'badge ' + (d.connected ? 'ok' : 'bad');
-    document.getElementById('status_line').textContent =
-      `driver=${{d.driver}} | uptime=${{d.uptime_s}}s | busy=${{d.busy}} | routes=${{d.routes.join(', ')}}`;
-    const last = d.last_action ? JSON.stringify(d.last_action).substring(0, 120) : 'none';
-    document.getElementById('output').textContent = last;
+    const badge = document.getElementById(badge);
+    badge.textContent = d.connected ? CONNECTED : DISCONNECTED;
+    badge.className = badge  + (d.connected ? ok : bad);
+    document.getElementById(status_line).textContent =
+      `driver=${{d.driver}} | uptime=${{d.uptime_s}}s | busy=${{d.busy}} | routes=${{d.routes.join(, )}}`;
+    const last = d.last_action ? JSON.stringify(d.last_action).substring(0, 120) : none;
+    document.getElementById(output).textContent = last;
+    if (d.camera) {{
+      cameraConfig = d.camera;
+      const input = document.getElementById(camera_url_input);
+      if (input && !input.value.trim()) {{
+        input.value = d.camera.stream_url || d.camera.snapshot_url || d.camera.page_url || ;
+      }}
+      renderCamera();
+    }}
   }} catch(e) {{}}
 }}
 refresh();
