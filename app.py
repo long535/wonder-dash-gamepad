@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import json
 import os
 import random
 import time
+from pathlib import Path
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,11 +18,14 @@ from driver_adapter import build_driver
 BASE_DIR = Path(__file__).resolve().parent
 ROUTES_FILE = BASE_DIR / "config" / "routes.example.yaml"
 GAMEPAD_CONFIG_FILE = BASE_DIR / "config" / "gamepad_bindings.json"
+RECORDINGS_DIR = BASE_DIR / "recordings"
+ACTIVE_RECORDING_FILE = RECORDINGS_DIR / "active_recording.json"
 DRIVER_MODE = os.getenv("WONDER_DASH_DRIVER", "mock")
 DASH_ADDRESS = os.getenv("WONDER_DASH_ADDRESS")
 ESP32_CAM_STREAM_URL = os.getenv("ESP32_CAM_STREAM_URL", "http://192.168.1.204/stream").strip()
 ESP32_CAM_SNAPSHOT_URL = os.getenv("ESP32_CAM_SNAPSHOT_URL", "http://192.168.1.204/capture").strip()
 ESP32_CAM_PAGE_URL = os.getenv("ESP32_CAM_PAGE_URL", "http://192.168.1.204/").strip()
+SENSOR_RECORD_INTERVAL_S = max(0.1, float(os.getenv("SENSOR_RECORD_INTERVAL_S", "0.25")))
 
 app = FastAPI(title="Wonder Dash Bridge", version="1.01")
 
@@ -76,6 +81,13 @@ class BridgeState:
         self.driver = DRIVER_MODE
         self.busy = False  # only used for blocking ops (route/wander)
         self.last_action: Optional[Dict[str, Any]] = None
+        self.recording = False
+        self.recording_name: Optional[str] = None
+        self.recorded_actions: List[Dict[str, Any]] = []
+        self.recording_started_at: Optional[float] = None
+        self.sensor_record_task: Optional[asyncio.Task] = None
+        self.sensor_record_interval_s = SENSOR_RECORD_INTERVAL_S
+        self.last_sensor_signature: Optional[str] = None
         self.started_at = time.time()
 
 
@@ -121,12 +133,275 @@ def save_gamepad_config(config: Dict[str, Any]) -> None:
     GAMEPAD_CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False))
 
 
+def _sanitize_recording_name(name: str) -> str:
+    cleaned = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '-' for ch in (name or 'recording'))
+    cleaned = cleaned.strip('-_') or 'recording'
+    return cleaned[:80]
+
+
+def _recordings_file(name: str) -> Path:
+    return RECORDINGS_DIR / f"{_sanitize_recording_name(name)}.json"
+
+
+def _persist_active_recording() -> None:
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'recording': state.recording,
+        'name': state.recording_name,
+        'started_at': state.recording_started_at,
+        'actions': state.recorded_actions,
+    }
+    ACTIVE_RECORDING_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _clear_active_recording_file() -> None:
+    try:
+        ACTIVE_RECORDING_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _append_recorded_action(action: str, payload: Dict[str, Any], result: Dict[str, Any]) -> None:
+    if not state.recording:
+        return
+    event = {
+        't': time.time(),
+        'action': action,
+        'payload': payload,
+        'result': result,
+    }
+    state.recorded_actions.append(event)
+    _persist_active_recording()
+
+
+async def _perform_and_record(action: str, payload: Dict[str, Any], fn):
+    result = await fn()
+    _append_recorded_action(action, payload, result)
+    return result
+
+
+def _append_sensor_snapshot(force: bool = False) -> bool:
+    if not state.recording:
+        return False
+    try:
+        sensors = driver.get_sensors()
+    except Exception:
+        return False
+    if not isinstance(sensors, dict) or not sensors:
+        return False
+    signature = json.dumps(sensors, sort_keys=True, ensure_ascii=False, default=str)
+    if not force and signature == state.last_sensor_signature:
+        return False
+    state.last_sensor_signature = signature
+    event = {
+        't': time.time(),
+        'action': 'sensor_snapshot',
+        'payload': {
+            'source': 'sensor_poll',
+            'sensors': sensors,
+        },
+        'result': {
+            'ok': True,
+            'changed': not force,
+            'keys': sorted(sensors.keys()),
+        },
+    }
+    state.recorded_actions.append(event)
+    _persist_active_recording()
+    return True
+
+
+async def _sensor_record_loop() -> None:
+    try:
+        while state.recording:
+            _append_sensor_snapshot(force=False)
+            await asyncio.sleep(state.sensor_record_interval_s)
+    except asyncio.CancelledError:
+        raise
+
+
+def _start_sensor_recording() -> None:
+    _stop_sensor_recording()
+    state.last_sensor_signature = None
+    _append_sensor_snapshot(force=True)
+    state.sensor_record_task = asyncio.create_task(_sensor_record_loop())
+
+
+def _stop_sensor_recording() -> None:
+    task = state.sensor_record_task
+    state.sensor_record_task = None
+    if task and not task.done():
+        task.cancel()
+
+
+def _load_recording_data(name: str) -> Dict[str, Any]:
+    path = _recordings_file(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail='recording not found')
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'invalid recording file: {exc}')
+
+
+def _sensor_snapshots(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [a for a in data.get('actions', []) if a.get('action') == 'sensor_snapshot' and isinstance(a.get('payload', {}).get('sensors'), dict)]
+
+
+def _recording_summary(data: Dict[str, Any]) -> Dict[str, Any]:
+    actions = data.get('actions', []) if isinstance(data.get('actions'), list) else []
+    sensor_actions = _sensor_snapshots(data)
+    command_actions = [a for a in actions if a.get('action') != 'sensor_snapshot']
+    first = sensor_actions[0].get('payload', {}).get('sensors', {}) if sensor_actions else {}
+    last = sensor_actions[-1].get('payload', {}).get('sensors', {}) if sensor_actions else {}
+    changed = {}
+    max_delta = None
+    for key in sorted(set(first) | set(last)):
+        a = first.get(key)
+        b = last.get(key)
+        if a != b:
+            changed[key] = {'from': a, 'to': b}
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                delta = abs(float(b) - float(a))
+                if max_delta is None or delta > max_delta.get('delta', -1):
+                    max_delta = {'key': key, 'from': a, 'to': b, 'delta': delta}
+
+    sampled_numeric = {}
+    for snap in sensor_actions:
+        sensors = snap.get('payload', {}).get('sensors', {})
+        for key, value in sensors.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                bucket = sampled_numeric.setdefault(key, {'min': value, 'max': value})
+                bucket['min'] = min(bucket['min'], value)
+                bucket['max'] = max(bucket['max'], value)
+
+    highlights = []
+    for key, stats in sampled_numeric.items():
+        if stats['min'] != stats['max']:
+            highlights.append({'key': key, 'min': stats['min'], 'max': stats['max'], 'range': stats['max'] - stats['min']})
+    highlights.sort(key=lambda item: item['range'], reverse=True)
+
+    return {
+        'name': data.get('name'),
+        'started_at': data.get('started_at'),
+        'ended_at': data.get('ended_at'),
+        'count': len(actions),
+        'command_count': len(command_actions),
+        'sensor_snapshot_count': len(sensor_actions),
+        'changed_keys': sorted(changed.keys()),
+        'changed_values': changed,
+        'top_sensor_ranges': highlights[:8],
+        'largest_end_to_end_change': max_delta,
+    }
+
+
+def _derive_look_steps(data: Dict[str, Any]) -> Dict[str, Any]:
+    sensor_actions = _sensor_snapshots(data)
+    if not sensor_actions:
+        return {'ok': True, 'name': data.get('name'), 'derived_steps': [], 'count': 0, 'source_snapshots': 0}
+
+    raw_points = []
+    for snap in sensor_actions:
+        sensors = snap.get('payload', {}).get('sensors', {})
+        t = snap.get('t')
+        yaw = sensors.get('head_yaw')
+        pitch = sensors.get('head_pitch')
+        if not isinstance(yaw, (int, float)) or not isinstance(pitch, (int, float)) or not isinstance(t, (int, float)):
+            continue
+        yaw = int(max(-95, min(95, yaw - 128)))
+        pitch = int(max(5, min(95, pitch)))
+        raw_points.append((float(t), yaw, pitch))
+
+    if not raw_points:
+        return {'ok': True, 'name': data.get('name'), 'derived_steps': [], 'count': 0, 'source_snapshots': len(sensor_actions)}
+
+    smoothed = []
+    window = 3
+    for idx, (t, _, _) in enumerate(raw_points):
+        start = max(0, idx - window)
+        end = min(len(raw_points), idx + window + 1)
+        subset = raw_points[start:end]
+        avg_yaw = round(sum(p[1] for p in subset) / len(subset))
+        avg_pitch = round(sum(p[2] for p in subset) / len(subset))
+        smoothed.append((t, int(avg_yaw), int(avg_pitch)))
+
+    keyframes = []
+    last_emit_t = None
+    last_emit_yaw = None
+    last_emit_pitch = None
+    prev_dyaw = None
+    prev_dpitch = None
+
+    def maybe_add(t: float, yaw: int, pitch: int, force: bool = False):
+        nonlocal last_emit_t, last_emit_yaw, last_emit_pitch
+        if not keyframes:
+            keyframes.append((t, yaw, pitch))
+            last_emit_t = t
+            last_emit_yaw = yaw
+            last_emit_pitch = pitch
+            return
+        time_gap = t - (last_emit_t or t)
+        yaw_gap = abs(yaw - (last_emit_yaw if last_emit_yaw is not None else yaw))
+        pitch_gap = abs(pitch - (last_emit_pitch if last_emit_pitch is not None else pitch))
+        if not force:
+            if time_gap < 0.75 and yaw_gap < 18 and pitch_gap < 12:
+                return
+            if yaw_gap < 10 and pitch_gap < 8:
+                return
+        keyframes.append((t, yaw, pitch))
+        last_emit_t = t
+        last_emit_yaw = yaw
+        last_emit_pitch = pitch
+
+    for idx, (t, yaw, pitch) in enumerate(smoothed):
+        if idx == 0:
+            maybe_add(t, yaw, pitch, force=True)
+            continue
+        pyaw = smoothed[idx - 1][1]
+        ppitch = smoothed[idx - 1][2]
+        dyaw = yaw - pyaw
+        dpitch = pitch - ppitch
+        turning = prev_dyaw is not None and ((dyaw > 0 > prev_dyaw) or (dyaw < 0 < prev_dyaw) or (dpitch > 0 > prev_dpitch) or (dpitch < 0 < prev_dpitch))
+        moved_far = abs(yaw - (last_emit_yaw if last_emit_yaw is not None else yaw)) >= 22 or abs(pitch - (last_emit_pitch if last_emit_pitch is not None else pitch)) >= 14
+        long_gap = last_emit_t is not None and (t - last_emit_t) >= 1.4
+        if turning or moved_far or long_gap:
+            maybe_add(t, yaw, pitch, force=turning or moved_far)
+        prev_dyaw = dyaw
+        prev_dpitch = dpitch
+
+    end_t, end_yaw, end_pitch = smoothed[-1]
+    maybe_add(end_t, end_yaw, end_pitch, force=True)
+
+    reduced = []
+    for t, yaw, pitch in keyframes:
+        if reduced:
+            prev = reduced[-1]
+            if abs(yaw - prev[1]) < 8 and abs(pitch - prev[2]) < 6:
+                reduced[-1] = (t, yaw, pitch)
+                continue
+        reduced.append((t, yaw, pitch))
+
+    derived = []
+    prev_t = None
+    for t, yaw, pitch in reduced:
+        payload = {'yaw': yaw, 'pitch': pitch}
+        if prev_t is not None:
+            payload['gap_s'] = max(0.0, min(2.0, float(t) - float(prev_t)))
+        derived.append({'t': t, 'action': 'look', 'payload': payload, 'source': 'sensor_teach'})
+        prev_t = t
+
+    return {'ok': True, 'name': data.get('name'), 'derived_steps': derived, 'count': len(derived), 'source_snapshots': len(sensor_actions)}
+
+
 # ── Startup ──────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup() -> None:
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        await driver.connect()
+        await asyncio.wait_for(driver.connect(), timeout=35.0)
     except Exception as exc:
         state.connected = False
         state.last_action = {
@@ -148,6 +423,12 @@ async def health() -> Dict[str, Any]:
         "busy": state.busy,
         "uptime_s": int(time.time() - state.started_at),
         "last_action": state.last_action,
+        "recording": {
+            "active": state.recording,
+            "name": state.recording_name,
+            "started_at": state.recording_started_at,
+            "count": len(state.recorded_actions),
+        },
         "routes": sorted(load_routes().keys()),
         "dash_address": DASH_ADDRESS,
         "camera": {
@@ -167,7 +448,7 @@ async def sensors() -> Dict[str, Any]:
 @app.post("/reconnect")
 async def reconnect() -> Dict[str, Any]:
     try:
-        await asyncio.wait_for(driver.reconnect(), timeout=8.0)
+        await asyncio.wait_for(driver.reconnect(), timeout=35.0)
         return {"ok": True, "connected": state.connected, "last_action": state.last_action}
     except asyncio.TimeoutError:
         state.connected = False
@@ -210,7 +491,9 @@ async def move(req: MoveRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="bridge busy")
     state.busy = True
     try:
-        return await driver.move(req.action, req.duration_ms, req.speed)
+        result = await _perform_and_record(req.action, {"duration_ms": req.duration_ms, "speed": req.speed}, lambda: driver.move(req.action, req.duration_ms, req.speed))
+        state.last_action = result
+        return result
     finally:
         state.busy = False
 
@@ -231,8 +514,9 @@ async def route(req: RouteRequest) -> Dict[str, Any]:
             action = step.get("action", "stop")
             duration_ms = int(step.get("duration_ms", 0))
             speed = int(step.get("speed", 120))
-            result = await driver.move(action, duration_ms, speed)
+            result = await _perform_and_record(action, {"duration_ms": duration_ms, "speed": speed}, lambda action=action, duration_ms=duration_ms, speed=speed: driver.move(action, duration_ms, speed))
             executed.append(result)
+            state.last_action = result
         return {"ok": True, "route": req.name, "steps": executed}
     finally:
         state.busy = False
@@ -240,23 +524,35 @@ async def route(req: RouteRequest) -> Dict[str, Any]:
 
 @app.post("/lights")
 async def lights(req: LightsRequest) -> Dict[str, Any]:
-    return await driver.lights(
+    result = await _perform_and_record("lights", {
+        "neck_color": req.neck_color,
+        "left_ear_color": req.left_ear_color,
+        "right_ear_color": req.right_ear_color,
+        "tail_brightness": req.tail_brightness,
+        "eye_brightness": req.eye_brightness,
+    }, lambda: driver.lights(
         neck_color=req.neck_color,
         left_ear_color=req.left_ear_color,
         right_ear_color=req.right_ear_color,
         tail_brightness=req.tail_brightness,
         eye_brightness=req.eye_brightness,
-    )
+    ))
+    state.last_action = result
+    return result
 
 
 @app.post("/look")
 async def look(req: LookRequest) -> Dict[str, Any]:
-    return await driver.look(yaw=req.yaw, pitch=req.pitch)
+    result = await _perform_and_record("look", {"yaw": req.yaw, "pitch": req.pitch}, lambda: driver.look(yaw=req.yaw, pitch=req.pitch))
+    state.last_action = result
+    return result
 
 
 @app.post("/speak")
 async def speak(req: SpeakRequest) -> Dict[str, Any]:
-    return await driver.speak(req.text)
+    result = await _perform_and_record("speak", {"text": req.text}, lambda: driver.speak(req.text))
+    state.last_action = result
+    return result
 
 
 @app.post("/wander")
@@ -273,11 +569,218 @@ async def wander(req: WanderRequest) -> Dict[str, Any]:
             action = random.choice(choices)
             duration_ms = random.choice([300, 500, 800, 1000])
             speed = random.choice([120, 140, 160])
-            result = await driver.move(action, duration_ms, speed)
+            result = await _perform_and_record(action, {"duration_ms": duration_ms, "speed": speed}, lambda action=action, duration_ms=duration_ms, speed=speed: driver.move(action, duration_ms, speed))
             executed.append(result)
+            state.last_action = result
             await asyncio.sleep(0.15)
         await driver.stop()
         return {"ok": True, "mode": "wander", "count": len(executed), "steps": executed}
+    finally:
+        state.busy = False
+
+
+@app.post("/record/start")
+async def record_start(req: Dict[str, Any]) -> Dict[str, Any]:
+    name = _sanitize_recording_name((req or {}).get('name') or time.strftime('recording-%Y%m%d-%H%M%S'))
+    state.recording = True
+    state.recording_name = name
+    state.recorded_actions = []
+    state.recording_started_at = time.time()
+    _start_sensor_recording()
+    _persist_active_recording()
+    return {"ok": True, "recording": {"active": True, "name": name, "count": len(state.recorded_actions), "started_at": state.recording_started_at}}
+
+
+@app.post("/record/stop")
+async def record_stop() -> Dict[str, Any]:
+    if not state.recording_name:
+        return {"ok": False, "error": "no recording prepared"}
+    _append_sensor_snapshot(force=True)
+    payload = {
+        "name": state.recording_name,
+        "started_at": state.recording_started_at,
+        "ended_at": time.time(),
+        "count": len(state.recorded_actions),
+        "actions": state.recorded_actions,
+    }
+    path = _recordings_file(state.recording_name)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    state.recording = False
+    _stop_sensor_recording()
+    state.recording_name = payload['name']
+    state.recording_started_at = None
+    state.last_sensor_signature = None
+    _clear_active_recording_file()
+    return {"ok": True, "saved": str(path), "recording": payload}
+
+
+@app.get("/record/status")
+async def record_status() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "recording": {
+            "active": state.recording,
+            "name": state.recording_name,
+            "started_at": state.recording_started_at,
+            "count": len(state.recorded_actions),
+        }
+    }
+
+
+@app.get("/record/list")
+async def record_list() -> Dict[str, Any]:
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(RECORDINGS_DIR.glob('*.json'))
+    recordings = []
+    for f in files:
+        if f.name == ACTIVE_RECORDING_FILE.name:
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            data = {}
+        summary = _recording_summary(data)
+        recordings.append({
+            "name": f.stem,
+            "count": int(data.get("count", len(data.get("actions", [])) if isinstance(data.get("actions"), list) else 0)),
+            "started_at": data.get("started_at"),
+            "ended_at": data.get("ended_at"),
+            "sensor_snapshot_count": summary.get("sensor_snapshot_count", 0),
+            "command_count": summary.get("command_count", 0),
+            "changed_keys": summary.get("changed_keys", []),
+        })
+    return {"ok": True, "recordings": recordings}
+
+
+@app.post("/record/rename")
+async def record_rename(req: Dict[str, Any]) -> Dict[str, Any]:
+    old_name = _sanitize_recording_name((req or {}).get('old_name') or '')
+    new_name = _sanitize_recording_name((req or {}).get('new_name') or '')
+    if not old_name or not new_name:
+        raise HTTPException(status_code=400, detail='missing recording names')
+    old_path = _recordings_file(old_name)
+    new_path = _recordings_file(new_name)
+    if not old_path.exists():
+        raise HTTPException(status_code=404, detail='recording not found')
+    if new_path.exists():
+        raise HTTPException(status_code=409, detail='target recording already exists')
+    data = json.loads(old_path.read_text())
+    data['name'] = new_name
+    new_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    old_path.unlink()
+    if state.recording_name == old_name and not state.recording:
+        state.recording_name = new_name
+    return {"ok": True, "old_name": old_name, "new_name": new_name}
+
+
+@app.post("/record/delete")
+async def record_delete(req: Dict[str, Any]) -> Dict[str, Any]:
+    name = _sanitize_recording_name((req or {}).get('name') or '')
+    if not name:
+        raise HTTPException(status_code=400, detail='missing recording name')
+    path = _recordings_file(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail='recording not found')
+    path.unlink()
+    if state.recording_name == name and not state.recording:
+        state.recording_name = None
+    return {"ok": True, "deleted": name}
+
+
+@app.get("/record/summary/{name}")
+async def record_summary(name: str) -> Dict[str, Any]:
+    safe_name = _sanitize_recording_name(name)
+    data = _load_recording_data(safe_name)
+    return {"ok": True, "summary": _recording_summary(data)}
+
+
+@app.post("/record/teach-look")
+async def record_teach_look(req: Dict[str, Any]) -> Dict[str, Any]:
+    name = _sanitize_recording_name((req or {}).get('name') or state.recording_name or '')
+    if not name:
+        raise HTTPException(status_code=400, detail='missing recording name')
+    data = _load_recording_data(name)
+    derived = _derive_look_steps(data)
+    save_as = _sanitize_recording_name((req or {}).get('save_as') or f'{name}-look-taught')
+    if derived['count']:
+        taught_payload = {
+            'name': save_as,
+            'started_at': data.get('started_at'),
+            'ended_at': data.get('ended_at'),
+            'count': derived['count'],
+            'actions': derived['derived_steps'],
+            'source_recording': name,
+            'generated_from': 'sensor_teach_look',
+        }
+        _recordings_file(save_as).write_text(json.dumps(taught_payload, indent=2, ensure_ascii=False))
+    return {"ok": True, "name": name, "save_as": save_as, **derived}
+
+
+@app.post("/record/replay")
+async def record_replay(req: Dict[str, Any]) -> Dict[str, Any]:
+    if state.recording:
+        raise HTTPException(status_code=409, detail='cannot replay while recording')
+    if state.busy:
+        raise HTTPException(status_code=409, detail='bridge busy')
+    auto_reconnect = bool((req or {}).get('auto_reconnect', False))
+    reconnect_timeout_s = max(3.0, min(12.0, float((req or {}).get('reconnect_timeout_s', 6.0))))
+    if not state.connected:
+        if not auto_reconnect:
+            raise HTTPException(status_code=409, detail='dash not connected; reconnect first or pass auto_reconnect=true')
+        try:
+            await asyncio.wait_for(driver.reconnect(), timeout=reconnect_timeout_s)
+        except Exception as exc:
+            state.connected = False
+            state.last_action = {
+                'action': 'replay_reconnect_failed',
+                'driver': state.driver,
+                'error': f'{type(exc).__name__}: {exc}',
+                'at': time.time(),
+            }
+            raise HTTPException(status_code=409, detail=f'dash reconnect failed before replay: {type(exc).__name__}')
+        if not state.connected:
+            raise HTTPException(status_code=409, detail='dash reconnect did not establish a connection')
+    name = _sanitize_recording_name((req or {}).get('name') or state.recording_name or '')
+    if not name:
+        raise HTTPException(status_code=400, detail='missing recording name')
+    path = _recordings_file(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail='recording not found')
+    data = json.loads(path.read_text())
+    executed = []
+    previous_t = None
+    state.busy = True
+    try:
+        for event in data.get('actions', []):
+            t = event.get('t')
+            if previous_t is not None and t is not None:
+                gap = max(0.0, min(3.0, float(t) - float(previous_t)))
+                if gap:
+                    await asyncio.sleep(gap)
+            previous_t = t
+            action = event.get('action')
+            payload = event.get('payload') or {}
+            if action in ('forward', 'backward', 'turn_left', 'turn_right', 'stop'):
+                result = await driver.move(action, int(payload.get('duration_ms', 0)), int(payload.get('speed', 120)))
+            elif action == 'lights':
+                result = await driver.lights(**payload)
+            elif action == 'look':
+                result = await driver.look(yaw=int(payload.get('yaw', 0)), pitch=int(payload.get('pitch', 0)))
+            elif action == 'speak':
+                result = await driver.speak(payload.get('text', ''))
+            elif action == 'sensor_snapshot':
+                executed.append({
+                    'ok': True,
+                    'action': 'sensor_snapshot',
+                    'skipped': True,
+                    'sensors': payload.get('sensors', {}),
+                })
+                continue
+            else:
+                continue
+            state.last_action = result
+            executed.append(result)
+        return {"ok": True, "name": name, "count": len(executed), "steps": executed}
     finally:
         state.busy = False
 
@@ -389,6 +892,9 @@ async def control_panel() -> str:
     .camera-placeholder {{ color: #94a3b8; font-size: 14px; text-align: center; padding: 24px; line-height: 1.6; }}
     .small {{ font-size: 12px; color: #64748b; }}
     .section-title {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
+    .record-dot {{ width: 10px; height: 10px; border-radius: 999px; display: inline-block; background: #64748b; margin-right: 6px; }}
+    .record-dot.live {{ background: #ef4444; box-shadow: 0 0 0 6px rgba(239,68,68,.15); }}
+    .record-list {{ min-width: 220px; max-width: 100%; }}
     @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -460,6 +966,34 @@ async def control_panel() -> str:
           <div class="row" style="margin-top:14px">
             <label>Wander s <input id="wander_s" type="number" value="10" /></label>
             <button onclick="wander()">Start Wander</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-title">
+            <h2 style="margin-bottom:0">⏺️ Recording / Replay</h2>
+            <div class="small" id="record_status_text"><span class="record-dot" id="record_dot"></span>idle</div>
+          </div>
+          <div class="row">
+            <label>Name <input id="record_name" type="text" value="demo-sequence" /></label>
+            <button class="primary" onclick="startRecording()">Start Recording</button>
+            <button class="stop" onclick="stopRecording()">Stop Recording</button>
+          </div>
+          <div class="row">
+            <label>Saved Recordings
+              <select id="recordings_select" class="record-list"></select>
+            </label>
+            <button onclick="refreshRecordings()">Refresh List</button>
+            <button class="success" onclick="playSelectedRecording()">▶ Play Selected</button>
+            <button onclick="renameSelectedRecording()">✏️ Rename</button>
+            <button class="stop" onclick="deleteSelectedRecording()">🗑 Delete</button>
+          </div>
+          <div class="small" id="record_meta">No recording activity yet.</div>
+          <div class="small" id="recordings_summary">No saved recordings yet.</div>
+          <div class="small" id="record_sensor_summary">No sensor summary yet.</div>
+          <div class="row" style="margin-top:10px">
+            <button onclick="showRecordingSummary()">📊 Sensor Summary</button>
+            <button onclick="teachLookFromSelected()">🧠 Teach Look</button>
           </div>
         </div>
 
@@ -603,11 +1137,11 @@ function openCameraPage() {{
   if (url) window.open(url, '_blank', 'noopener');
 }}
 
-// ── Generic API call ──
-async function api(path, body) {{
+// ── Generic API calls ──
+async function api(path, body, timeoutMs = 10000) {{
   try {{
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(path, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
@@ -624,17 +1158,11 @@ async function api(path, body) {{
   }}
 }}
 
-// ── Generic API call ──
-async function api(path, body) {{
+async function apiGet(path, timeoutMs = 10000) {{
   try {{
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch(path, {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify(body),
-      signal: controller.signal
-    }});
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(path, {{ signal: controller.signal }});
     clearTimeout(timeout);
     const text = await res.text();
     document.getElementById('output').textContent = text;
@@ -760,10 +1288,141 @@ async function pollSensors() {{
 }}
 
 // ── Status refresh ──
+function updateRecordingUi(rec) {{
+  const dot = document.getElementById('record_dot');
+  const status = document.getElementById('record_status_text');
+  const meta = document.getElementById('record_meta');
+  if (!dot || !status || !meta || !rec) return;
+  dot.className = 'record-dot' + (rec.active ? ' live' : '');
+  const started = rec.started_at ? new Date(rec.started_at * 1000).toLocaleTimeString() : '—';
+  status.textContent = rec.active ? 'recording' : 'idle';
+  status.prepend(dot);
+  meta.textContent = `name=${{rec.name || '—'}} | steps=${{rec.count ?? 0}} | started=${{started}}`;
+}}
+
+let recordingsCache = [];
+
+function formatChangedKeys(keys) {{
+  if (!Array.isArray(keys) || !keys.length) return 'none';
+  return keys.slice(0, 6).join(', ') + (keys.length > 6 ? ` +${keys.length - 6}` : '');
+}}
+
+function updateRecordSensorSummary(text) {{
+  const el = document.getElementById('record_sensor_summary');
+  if (el) el.textContent = text || 'No sensor summary yet.';
+}}
+
+function updateRecordingsSummary() {{
+  const summary = document.getElementById('recordings_summary');
+  const sel = document.getElementById('recordings_select');
+  if (!summary || !sel) return;
+  if (!recordingsCache.length) {{
+    summary.textContent = 'No saved recordings yet.';
+    return;
+  }}
+  const current = recordingsCache.find(r => r.name === sel.value) || recordingsCache[0];
+  summary.textContent = `saved=${{recordingsCache.length}} | selected=${{current.name}} | steps=${{current.count ?? 0}} | cmd=${{current.command_count ?? 0}} | sensors=${{current.sensor_snapshot_count ?? 0}}`;
+  updateRecordSensorSummary(`changed=${{formatChangedKeys(current.changed_keys)}}`);
+}}
+
+async function refreshRecordings(selectName = '') {{
+  const data = await apiGet('/record/list');
+  const sel = document.getElementById('recordings_select');
+  if (!sel || !data || !Array.isArray(data.recordings)) return;
+  recordingsCache = data.recordings;
+  const current = selectName || sel.value;
+  sel.innerHTML = '';
+  for (const rec of data.recordings) {{
+    const opt = document.createElement('option');
+    opt.value = rec.name;
+    opt.textContent = `${{rec.name}} (${{rec.count ?? 0}} steps)`;
+    if (rec.name === current) opt.selected = true;
+    sel.appendChild(opt);
+  }}
+  if (!sel.options.length) {{
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No recordings yet';
+    sel.appendChild(opt);
+  }}
+  updateRecordingsSummary();
+}}
+
+async function startRecording() {{
+  const name = document.getElementById('record_name').value.trim() || 'demo-sequence';
+  const res = await api('/record/start', {{ name }});
+  if (res && res.recording) {{
+    updateRecordingUi(res.recording);
+    await refreshRecordings(name);
+  }}
+}}
+
+async function stopRecording() {{
+  const res = await api('/record/stop', {{}});
+  if (res && res.recording) {{
+    updateRecordingUi({{ active: false, name: res.recording.name, started_at: res.recording.started_at, count: res.recording.count }});
+    document.getElementById('record_name').value = res.recording.name || document.getElementById('record_name').value;
+    await refreshRecordings(res.recording.name || '');
+  }}
+}}
+
+async function playSelectedRecording() {{
+  const sel = document.getElementById('recordings_select');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+  await api('/record/replay', {{ name }}, 60000);
+}}
+
+async function showRecordingSummary() {{
+  const sel = document.getElementById('recordings_select');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+  const res = await apiGet(`/record/summary/${{encodeURIComponent(name)}}`);
+  if (!res || !res.summary) return;
+  const s = res.summary;
+  updateRecordSensorSummary(`sensors=${{s.sensor_snapshot_count}} | changed=${{formatChangedKeys(s.changed_keys)}} | top=${{(s.top_sensor_ranges || []).slice(0,3).map(x => `${x.key}:${x.range}`).join(' / ') || 'none'}}`);
+}}
+
+async function teachLookFromSelected() {{
+  const sel = document.getElementById('recordings_select');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+  const saveAs = `${name}-look-taught`;
+  const res = await api('/record/teach-look', {{ name, save_as: saveAs }}, 20000);
+  if (res && res.ok) {{
+    updateRecordSensorSummary(`teach-look => ${{res.save_as}} | steps=${{res.count}} | source_snapshots=${{res.source_snapshots}}`);
+    await refreshRecordings(res.save_as);
+  }}
+}}
+
+async function renameSelectedRecording() {{
+  const sel = document.getElementById('recordings_select');
+  const oldName = sel ? sel.value : '';
+  if (!oldName) return;
+  const newName = prompt('Rename recording to:', oldName);
+  if (!newName || newName.trim() === oldName) return;
+  const res = await api('/record/rename', {{ old_name: oldName, new_name: newName.trim() }});
+  if (res && res.new_name) {{
+    document.getElementById('record_name').value = res.new_name;
+    await refreshRecordings(res.new_name);
+  }}
+}}
+
+async function deleteSelectedRecording() {{
+  const sel = document.getElementById('recordings_select');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+  if (!confirm(`Delete recording "${{name}}"?`)) return;
+  const res = await api('/record/delete', {{ name }});
+  if (res && res.deleted) {{
+    await refreshRecordings('');
+  }}
+}}
+
 async function refresh() {{
   try {{
-    const res = await fetch('/health');
-    const d = await res.json();
+    const d = await apiGet('/health');
+    if (!d) return;
     const badge = document.getElementById('badge');
     badge.textContent = d.connected ? 'CONNECTED' : 'DISCONNECTED';
     badge.className = 'badge ' + (d.connected ? 'ok' : 'bad');
@@ -771,6 +1430,7 @@ async function refresh() {{
       `driver=${{d.driver}} | uptime=${{d.uptime_s}}s | busy=${{d.busy}} | routes=${{d.routes.join(', ')}}`;
     const last = d.last_action ? JSON.stringify(d.last_action).substring(0, 120) : 'none';
     document.getElementById('output').textContent = last;
+    if (d.recording) updateRecordingUi(d.recording);
     if (d.camera) {{
       cameraConfig = d.camera;
       const input = document.getElementById('camera_url_input');
@@ -782,7 +1442,10 @@ async function refresh() {{
   }} catch(e) {{}}
 }}
 refresh();
+refreshRecordings();
 setInterval(refresh, 3000);
+setInterval(refreshRecordings, 10000);
+document.getElementById('recordings_select').addEventListener('change', updateRecordingsSummary);
 
 // ── Populate sounds dropdown ──
 (async function() {{

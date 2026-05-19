@@ -165,44 +165,93 @@ class RealDashDriver(BaseDashDriver):
         self._driving = False
         self._driving_action: Optional[str] = None
         self._drive_task: Optional[asyncio.Task] = None
+        self._connect_lock = asyncio.Lock()
+
+    async def _bluetoothctl(self, *commands: str, timeout: float = 10.0) -> str:
+        script = "\n".join(commands) + "\n"
+        proc = await asyncio.create_subprocess_exec(
+            'bluetoothctl',
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(script.encode()), timeout=timeout)
+        return stdout.decode(errors='ignore')
+
+    async def _ble_warmup_scan(self, seconds: int = 6) -> None:
+        try:
+            await self._bluetoothctl(f'scan on', f'info {self.address}', f'scan off', timeout=max(8.0, seconds + 4.0))
+        except Exception:
+            pass
+
+    async def _disconnect_robot(self) -> None:
+        if self._obstacle_task and not self._obstacle_task.done():
+            self._obstacle_task.cancel()
+            self._obstacle_task = None
+        if self._drive_task and not self._drive_task.done():
+            self._drive_task.cancel()
+        self._drive_task = None
+        if self.robot and hasattr(self.robot, 'disconnect'):
+            try:
+                await self.robot.disconnect()
+            except Exception:
+                pass
+        self.robot = None
+        self.state.connected = False
+        self._driving = False
+        self._driving_action = None
 
     async def connect(self) -> None:
-        if not self.address:
-            self.state.connected = False
-            self.robot = None
-            self.state.last_action = {
-                "action": "connect_failed",
-                "driver": self.name,
-                "reason": "missing_address",
-                "at": time.time(),
-            }
-            return
+        async with self._connect_lock:
+            if not self.address:
+                self.state.connected = False
+                self.robot = None
+                self.state.last_action = {
+                    "action": "connect_failed",
+                    "driver": self.name,
+                    "reason": "missing_address",
+                    "at": time.time(),
+                }
+                return
 
-        from dash.robot import DashRobot
+            from dash.robot import DashRobot
 
-        self.robot = DashRobot(self.address)
-        try:
-            await self.robot.connect()
-        except Exception as exc:
-            self.state.connected = False
-            self.robot = None
-            self.state.last_action = {
-                "action": "connect_failed",
-                "driver": self.name,
-                "address": self.address,
-                "error": f"{type(exc).__name__}: {exc}",
-                "at": time.time(),
-            }
-            raise
-        self.state.connected = True
-        self.state.last_action = {
-            "action": "connected",
-            "driver": self.name,
-            "address": self.address,
-            "at": time.time(),
-        }
-        # Start obstacle monitor
-        self._start_obstacle_monitor()
+            last_exc = None
+            for attempt in range(1, 4):
+                await self._disconnect_robot()
+                if attempt > 1:
+                    await self._ble_warmup_scan(6)
+                    await asyncio.sleep(1.0)
+                self.robot = DashRobot(self.address)
+                try:
+                    await asyncio.wait_for(self.robot.connect(), timeout=12.0)
+                    self.state.connected = True
+                    self.state.last_action = {
+                        "action": "connected",
+                        "driver": self.name,
+                        "address": self.address,
+                        "attempt": attempt,
+                        "at": time.time(),
+                    }
+                    self._start_obstacle_monitor()
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    msg = f"{type(exc).__name__}: {exc}"
+                    self.state.connected = False
+                    self.robot = None
+                    self.state.last_action = {
+                        "action": "connect_retrying" if attempt < 3 else "connect_failed",
+                        "driver": self.name,
+                        "address": self.address,
+                        "attempt": attempt,
+                        "error": msg,
+                        "at": time.time(),
+                    }
+                    if 'InProgress' in msg or 'not found' in msg.lower() or 'not connectable' in msg.lower() or 'TimeoutError' in msg:
+                        continue
+                    raise
+            raise last_exc
 
     def _start_obstacle_monitor(self) -> None:
         if self._obstacle_task is None or self._obstacle_task.done():
@@ -255,17 +304,9 @@ class RealDashDriver(BaseDashDriver):
                 await asyncio.sleep(1)
 
     async def reconnect(self) -> None:
-        if self._obstacle_task and not self._obstacle_task.done():
-            self._obstacle_task.cancel()
-            self._obstacle_task = None
-        if self.robot and hasattr(self.robot, "disconnect"):
-            try:
-                await self.robot.disconnect()
-            except Exception:
-                pass
-        self.robot = None
-        self.state.connected = False
-        self._driving = False
+        await self._disconnect_robot()
+        await self._ble_warmup_scan(6)
+        await asyncio.sleep(1.0)
         await self.connect()
 
     async def _ensure_connected(self) -> None:
